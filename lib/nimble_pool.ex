@@ -262,6 +262,7 @@ defmodule NimblePool do
 
     * On lazy pools, if no worker is currently on the pool the callback will never be called.
       Therefore you can not rely on this callback to terminate empty lazy pools.
+      Use `c:handle_pool_info/2` with `pool_send_after/3` for pool-level checks instead.
 
     * On not lazy pools, if you return `{:remove, user_reason}` you may end up
       terminating and initializing workers at the same time every idle verification cycle.
@@ -318,6 +319,39 @@ defmodule NimblePool do
               pool_state
             ) :: :ok
 
+  @doc """
+  Handles a message sent to the pool with `pool_send/2` or `pool_send_after/3`.
+
+  Unlike `c:handle_info/2`, which is invoked once per worker, this callback is
+  invoked once for the pool itself, regardless of how many workers it has. This
+  allows pool-level logic such as terminating a lazy pool after a period of
+  inactivity, even when it has no workers and `c:handle_ping/2` would never be
+  called:
+
+      def init_pool(idle_timeout) do
+        NimblePool.pool_send_after(self(), :check_idle, idle_timeout)
+        {:ok, %{idle_timeout: idle_timeout}}
+      end
+
+      def handle_pool_info(:check_idle, pool_state) do
+        if idle?(pool_state) do
+          {:stop, :idle_timeout}
+        else
+          NimblePool.pool_send_after(self(), :check_idle, pool_state.idle_timeout)
+          {:ok, pool_state}
+        end
+      end
+
+  Returning `{:stop, user_reason}` terminates the pool with
+  `{:shutdown, user_reason}`, in the same way as `c:handle_ping/2`.
+
+  This callback is optional, but it must be implemented if `pool_send/2` or
+  `pool_send_after/3` are used.
+  """
+  @doc callback: :pool
+  @callback handle_pool_info(message :: term, pool_state) ::
+              {:ok, pool_state} | {:stop, user_reason()}
+
   @optional_callbacks init_pool: 1,
                       handle_checkin: 4,
                       handle_info: 2,
@@ -326,7 +360,8 @@ defmodule NimblePool do
                       handle_ping: 2,
                       terminate_worker: 3,
                       terminate_pool: 2,
-                      handle_cancelled: 2
+                      handle_cancelled: 2,
+                      handle_pool_info: 2
 
   @doc """
   Defines a pool to be started under the supervision tree.
@@ -497,6 +532,31 @@ defmodule NimblePool do
   def update({pid, ref} = _from, command) do
     send(pid, {__MODULE__, :update, ref, command})
     :ok
+  end
+
+  @doc """
+  Sends `message` to the pool, to be handled by `c:handle_pool_info/2`.
+
+  Messages sent to the pool process directly are given to the
+  `c:handle_info/2` callback of every worker instead.
+  """
+  @doc since: "1.2.0"
+  @spec pool_send(pid | atom, message :: term) :: :ok
+  def pool_send(pool, message) do
+    send(pool, {__MODULE__, :pool_info, message})
+    :ok
+  end
+
+  @doc """
+  Sends `message` to the pool after `time` milliseconds, to be handled
+  by `c:handle_pool_info/2`.
+
+  Returns a timer reference, as `Process.send_after/4` does.
+  """
+  @doc since: "1.2.0"
+  @spec pool_send_after(pid | atom, message :: term, non_neg_integer) :: reference
+  def pool_send_after(pool, message, time) do
+    Process.send_after(pool, {__MODULE__, :pool_info, message}, time)
   end
 
   defp deadline(timeout) when is_integer(timeout) do
@@ -720,6 +780,14 @@ defmodule NimblePool do
 
       {:stop, reason, state} ->
         {:stop, {:shutdown, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_info({__MODULE__, :pool_info, message}, %{worker: worker, state: pool_state} = state) do
+    case worker.handle_pool_info(message, pool_state) do
+      {:ok, pool_state} -> {:noreply, %{state | state: pool_state}}
+      {:stop, reason} -> {:stop, {:shutdown, reason}, state}
     end
   end
 

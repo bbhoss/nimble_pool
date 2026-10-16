@@ -28,6 +28,10 @@ defmodule NimblePoolTest do
       next(instructions, :handle_ping, &[&1, pool_state])
     end
 
+    def handle_pool_info(message, instructions) do
+      next(instructions, :handle_pool_info, &[message, &1])
+    end
+
     def terminate_worker(reason, instructions, pool_state) do
       # We always allow skip ahead on terminate
       instructions = Enum.drop_while(instructions, &(elem(&1, 0) != :terminate_worker))
@@ -111,6 +115,10 @@ defmodule NimblePoolTest do
 
     def handle_cancelled(context, pool_state) do
       TestAgent.next(pool_state, :handle_cancelled, [context, pool_state])
+    end
+
+    def handle_pool_info(message, pool_state) do
+      TestAgent.next(pool_state, :handle_pool_info, [message, pool_state])
     end
   end
 
@@ -1872,6 +1880,85 @@ defmodule NimblePoolTest do
              end) == :result
 
       NimblePool.stop(pool, :shutdown)
+    end
+  end
+
+  describe "handle_pool_info" do
+    test "is invoked once per message sent with pool_send/2 instead of once per worker" do
+      parent = self()
+
+      {agent, pool} =
+        stateful_pool!(
+          [
+            init_worker: fn next -> {:ok, :worker1, next} end,
+            init_worker: fn next -> {:ok, :worker2, next} end,
+            handle_pool_info: fn message, pool_state ->
+              send(parent, {:pool_info, message})
+              {:ok, pool_state}
+            end
+          ],
+          pool_size: 2
+        )
+
+      assert NimblePool.pool_send(pool, :hello) == :ok
+      assert_receive {:pool_info, :hello}
+
+      assert :queue.len(:sys.get_state(pool).resources) == 2
+      assert_drained(agent)
+    end
+
+    test "is invoked for messages sent with pool_send_after/3" do
+      parent = self()
+
+      {agent, pool} =
+        stateful_pool!(
+          init_worker: fn next -> {:ok, :worker1, next} end,
+          handle_pool_info: fn message, pool_state ->
+            send(parent, {:pool_info, message})
+            {:ok, pool_state}
+          end
+        )
+
+      assert is_reference(NimblePool.pool_send_after(pool, :later, 1))
+      assert_receive {:pool_info, :later}
+      assert_drained(agent)
+    end
+
+    test "terminates the pool and its workers on {:stop, reason}" do
+      parent = self()
+
+      {_agent, pool} =
+        stateful_pool!(
+          init_worker: fn next -> {:ok, :worker1, next} end,
+          handle_pool_info: fn :stop, _pool_state -> {:stop, :some_reason} end,
+          terminate_worker: fn reason, worker, state ->
+            send(parent, {:terminated_worker, worker, reason})
+            {:ok, state}
+          end
+        )
+
+      ref = Process.monitor(pool)
+      NimblePool.pool_send(pool, :stop)
+
+      assert_receive {:DOWN, ^ref, :process, ^pool, {:shutdown, :some_reason}}
+      assert_received {:terminated_worker, :worker1, {:shutdown, :some_reason}}
+    end
+
+    test "can terminate an empty lazy pool from a timer scheduled in init_pool" do
+      Process.flag(:trap_exit, true)
+
+      instructions = [
+        init_pool: fn next ->
+          NimblePool.pool_send_after(self(), :check_idle, 1)
+          {:ok, next}
+        end,
+        handle_pool_info: fn :check_idle, _next -> {:stop, :idle_timeout} end
+      ]
+
+      {:ok, pool} =
+        NimblePool.start_link(worker: {StatelessPool, instructions}, pool_size: 1, lazy: true)
+
+      assert_receive {:EXIT, ^pool, {:shutdown, :idle_timeout}}
     end
   end
 end
